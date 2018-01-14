@@ -1,161 +1,191 @@
-var Session = require('./session.js');
 var DB = require('./database.js');
 var HtmlPreprocessor = require('./html-preprocessor.js');
-let TinyRouter = require('./tiny-router.js');
+
 var http = require('http');
 var fs = require('fs');
 var sha = require('sha1');
 
+const express = require('express');
+const bodyParser = require('body-parser');
+const fileUpload = require('express-fileupload');
+const session = require('express-session');
+
+const app = express();
+app.use(bodyParser.urlencoded({ extended: true}));
+app.use(express.static(__dirname + '/public'));
+app.use(fileUpload());
+app.use(session({secret: "Hello", resave: false, saveUninitialized: false}));
+
 DB.initialize();
 
-var app = new TinyRouter();
 
-app.get('/', (request) => {
-    return showPage('./pages/home.html', {
-        searchTitle: 'Most viewed',
-        videos: DB.videos(),
-        user: Session.get(request, 'user_id') != undefined
-    });
+// --- Home ---
+
+app.get('/', (req, res) => {
+    res.redirect("/home");
 });
 
-app.get('/home', (request) => {
-    return showPage('./pages/home.html', {
+app.get('/home', (req, res) => {
+    res.send( showPage('./pages/home.html', {
         searchTitle: 'Most viewed',
         videos: DB.videos(),
-        user: Session.get(request, 'user_id') != undefined
-    });
+        user: getUser(req) != undefined
+    }))
 });
 
-app.get('/results', (request, params) => {
-    return showPage('./pages/search.html', {
+// --- search ---
+
+app.get('/results', (req, res) => {
+    res.send( showPage('./pages/search.html', {
         searchTitle: 'Search results',
-        videos: DB.videosByTitle(params.search),
-        user: Session.get(request, 'user_id') != undefined
+        videos: DB.videosByTitle(req.query['search']),
+        user: getUser(req) != undefined
 
-    });
+    }))
 });
 
+// --- Videos ---
 
-app.get('/watch', (request, params) => {
+app.get('/watch', (req, res) => {
 
-    if (params.v == undefined) return 'invalid request';
+    if (req.query['v'] == undefined) 
+        res.sendStatus(404);;
 
-    var video = DB.videoByID(params.v);
-    var comments = DB.comments(params.v);
-    var rating = DB.rating(params.v).total;
+    var video = DB.videoByID(req.query.v);
+    var comments = DB.comments(req.query.v);
+    var rating = DB.rating(req.query.v).total;
 
     if(typeof(rating) != 'number') rating = 0;
 
     if(video != undefined){
-        return showPage('./pages/watch.html', {
-            video: video,
-            comments: comments,
-            rating: rating,
-            user: Session.get(request, 'user_id') != undefined
-        });
+        res.send(
+            showPage('./pages/watch.html', {
+                video: video,
+                comments: comments,
+                rating: rating,
+                user: getUser(req) != undefined
+            })
+        )
     }
-    return 'potato request';
+    else
+    res.sendStatus(404);
 });
 
-app.post('/comment', (request, fields) => {
+app.post('/comment', (req, res) => {
 
-    if(!checkLogin(request)) return JSON.stringify({status: 'unauthenticated'});
+    if(!userLoggedIn(req)) 
+        return res.send( JSON.stringify({status: 'unauthenticated'}));
 
-    var video = DB.videoByID(fields['video']);
-    var comment = fields['comment'];
+    var video = DB.videoByID(req.body.video);
+    var comment = req.body.comment;
     
     if(video == undefined || comment == undefined || comment.length > 512 || comment.length == 0) return JSON.stringify({status: 'error', message: 'invalid input'});
 
-    DB.createComment(Session.get(request, 'user_id'), comment, video.id);
-    return JSON.stringify({status: 'success', comment: DB.comments(video.id).slice(-1)[0]});
+    DB.createComment(getUser(req), comment, video.id);
+    res.send( JSON.stringify({status: 'success', comment: DB.comments(video.id).slice(-1)[0]}));
 });
 
-app.post('/rating', (request, fields) => {
+app.post('/rating', (req, res) => {
 
-    if(!checkLogin(request)) return JSON.stringify({status: 'unauthenticated'});
+    if(!userLoggedIn(req)) 
+        return res.send( JSON.stringify({status: 'unauthenticated'}));
 
-    var video = DB.videoByID(fields['video']);
-    var rating = Math.min(Math.max(fields['rating'], -1), 1);
+    var video = DB.videoByID(req.body.video);
+    var rating = Math.min(Math.max(req.body.rating, -1), 1);
 
     if(video == undefined) return JSON.stringify({status: 'error', message: 'video not found'});
 
-    DB.createRating(Session.get(request, 'user_id'), video.id, rating);
+    DB.createRating(getUser(req), video.id, rating);
 
     var newRating = DB.rating(video.id).total;
 
-    return JSON.stringify({status: 'success', newRating: newRating});
+    res.send( JSON.stringify({status: 'success', newRating: newRating}));
 });
 
-app.get('/sessionTester', (request, params) => {
-    return showPage('./pages/debug.html', { debug: JSON.stringify(Session.load(request)) });
+
+// --- Upload ---
+
+app.get('/upload', (req, res) => {
+    if(!userLoggedIn(req))
+        res.sendStatus(403);
+    else
+        res.send(showPage('./pages/upload.html', {user: getUser(req) != undefined}));
 })
 
-app.get('/upload', (request, params) => {
-    if(Session.get(request, 'user_id') != undefined)
-        return showPage('./pages/upload.html', {user: Session.get(request, 'user_id') != undefined});
+app.post('/upload', (req, res) => {
+
+    if(!userLoggedIn(req)) 
+        return res.send( JSON.stringify({status: 'unauthenticated'}));
+
     
-    return showPage('./pages/403.html', {});
+    var title = req.body.title;
+    var description = req.body.description;
 
-})
+    var video = req.files.video;
 
-app.get('/login', (request, params) => {
+    if (video == undefined || video.mimetype != 'video/mp4') 
+        return res.send( JSON.stringify({ status: 'error', message: 'video incorrect format or missing!' }));
+    if ((title == undefined || title.length > 50) || (description == undefined || description.length > 255)) 
+        return res.send(JSON.stringify({ status: 'error', message: 'title and description missing or too long' }));
 
-    return showPage('./pages/login.html', {});
-});
-
-app.get('/createuser', (request, params) => {
-    
-        return showPage('./pages/createuser.html', {});
-    });
-
-app.post('/upload', (request, fields, files) => {
-
-
-    if(!checkLogin(request)) return JSON.stringify({status: 'unauthenticated'});
-
-    var video = files['video'];
-    var title = fields['title'];
-    var description = fields['description'];
-
-    if (video == undefined || video.type != 'video/mp4') return JSON.stringify({ status: 'error', message: 'video incorrect format or missing!' });
-    if ((title == undefined || title.length > 50) || (description == undefined || description.length > 255)) return JSON.stringify({ status: 'error', message: 'title and description missing or too long' });
+    video.mv(__dirname + "/public/videos/" + title + ".mp4", function(err){
+        if(err)
+            return res.status(500);
+    })
 
     var id = DB.createVideo(title, description, 1);
 
-    fs.rename(video.path, './public/videos/' + id + '.mp4')
+    fs.rename(__dirname + "/public/videos/" + title + ".mp4", './public/videos/' + id + '.mp4')
 
-    return JSON.stringify({ status: 'success', video: id });
+    return res.send( JSON.stringify({ status: 'success', video: id }));
 });
 
-app.post('/login', (request, fields, files) => {
 
-    var username = fields['username'];
-    var password = sha(fields['password']);
+// --- Login ---
 
-    var user = DB.ValidateUser(username, password);
+app.get('/login', (req, res) => {
+     res.send(showPage('./pages/login.html', {}));
+});
+
+app.post('/login', (req, res) => {
+     var username = req.body.username;
+     var password = sha(req.body.password);
+     var user = DB.ValidateUser(username, password);
 
     if (user) {
-        Session.set(request, 'user_id', user.id);
-        return JSON.stringify({ status: 'success', message: 'You are now logged in, redirecting...'});
+        setUser(req, user.id);
+        //Session.set(req, 'user_id', user.id);
+        res.send(JSON.stringify({ status: 'success', message: '/Home' }));
     }
     else
-        return JSON.stringify({ status: 'error', message: 'Invalid password or username' });
-
-
+        res.send(JSON.stringify({ status: 'error', message: 'Invalid password or username' }));
 });
 
-app.post('/createuser', (request, fields, files) => {
-    
-    var username = fields['username'];
-    var password = sha(fields['password']);
+app.get('/logout', (req, res) => {
+    setUser(req, undefined);
+    //Session.set(req, 'user_id', null);
+    res.redirect("/home");
+});
+
+// --- Create User ---
+
+app.get('/createuser', (req, res) => {
+    res.send(showPage('./pages/createuser.html', {}));
+});
+
+app.post('/createuser', (req, res) => {
+    var username = req.body.username;
+    var password = sha(req.body.password);
 
     DB.createUser(username, password);
-    return JSON.stringify({ status: 'success' });
+    res.send( JSON.stringify({ status: 'success', message:"/login" }));
 });
 
-function checkLogin(request){
-    return (Session.get(request, 'user_id') != undefined);
-}
+//Session.clearAll();
+app.use( (req, res) => {res.sendStatus(404);})
+app.listen(3000, () => console.log('Youtublers Start'));
+
+
 
 function showPage(path, vars) {
     var file = fs.readFileSync(path);
@@ -165,5 +195,19 @@ function showPage(path, vars) {
 
 }
 
-Session.clearAll();
-app.listen(8080);
+function userLoggedIn(request){
+    return request.session.user != undefined;
+}
+
+function getUser(request)
+{
+    return request.session.user;
+}
+
+function setUser(request, user)
+{
+    request.session.user = user;
+}
+
+
+
